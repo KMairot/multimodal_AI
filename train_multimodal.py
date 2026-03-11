@@ -167,7 +167,8 @@ def unfreeze_last_blocks(vit_model: nn.Module, n_last_blocks=2):
 class MultimodalDataset(Dataset):
     """
     Colonnes manifest minimales:
-      split,gene,case_id,has_oct,has_ir,has_faf,oct_path,ir_path,faf_path
+      split,(sgene|gene),(case_id optionnel),has_oct,has_ir,has_faf,oct_path,ir_path,faf_path
+      + patient_key/laterality optionnels pour reconstruire case_id.
 
     Convention fundus stricte (défaut): has_fundus=1 seulement si IR+FAF.
     """
@@ -182,6 +183,7 @@ class MultimodalDataset(Dataset):
         df: pd.DataFrame,
         classes: List[str],
         split: str,
+        label_col: str,
         oct_h: int = 256,
         oct_w: int = 512,
         n_slices: int = 19,
@@ -192,6 +194,7 @@ class MultimodalDataset(Dataset):
         self.df = df[df["split"] == split].reset_index(drop=True)
         self.classes = list(classes)
         self.cls_to_idx = {c: i for i, c in enumerate(self.classes)}
+        self.label_col = str(label_col)
         self.oct_h, self.oct_w, self.n_slices = oct_h, oct_w, n_slices
         self.strict_fundus_pair = strict_fundus_pair
         self.augment = augment
@@ -228,7 +231,7 @@ class MultimodalDataset(Dataset):
 
     def __getitem__(self, i: int) -> Dict[str, Any]:
         r = self.df.iloc[i]
-        y = self.cls_to_idx[r["gene"]]
+        y = self.cls_to_idx[r[self.label_col]]
         has_oct = int(str(r.get("has_oct", "0")) == "1" and str(r.get("oct_path", "")) != "")
         has_ir = int(str(r.get("has_ir", "0")) == "1" and str(r.get("ir_path", "")) != "")
         has_faf = int(str(r.get("has_faf", "0")) == "1" and str(r.get("faf_path", "")) != "")
@@ -239,6 +242,17 @@ class MultimodalDataset(Dataset):
         ir_x = tf(load_pil_gray_as_rgb(r["ir_path"])) if has_ir else torch.zeros(3, self.fundus_size, self.fundus_size)
         faf_x = tf(load_pil_gray_as_rgb(r["faf_path"])) if has_faf else torch.zeros(3, self.fundus_size, self.fundus_size)
 
+        case_id = str(r.get("case_id", ""))
+        if not case_id:
+            pk = str(r.get("patient_key", ""))
+            lat = str(r.get("laterality", ""))
+            if pk and lat:
+                case_id = f"{pk}_{lat}"
+            elif pk:
+                case_id = pk
+            else:
+                case_id = f"idx_{i}"
+
         return {
             "oct": oct_x,
             "ir": ir_x,
@@ -246,7 +260,7 @@ class MultimodalDataset(Dataset):
             "has_oct": torch.tensor(has_oct, dtype=torch.float32),
             "has_fundus": torch.tensor(has_fundus, dtype=torch.float32),
             "label": torch.tensor(y, dtype=torch.long),
-            "case_id": str(r.get("case_id", f"idx_{i}")),
+            "case_id": case_id,
         }
 
 
@@ -863,6 +877,7 @@ def parse_args():
     p.add_argument("--seed", type=int, default=1998)
     p.add_argument("--num-classes", type=int, default=None)
     p.add_argument("--fundus-size", type=int, default=256)
+    p.add_argument("--label-col", type=str, default="auto", help="Column name for label (e.g., sgene or gene)")
 
     p.add_argument("--lr-head", type=float, default=1e-3)
     p.add_argument("--lr-oct-backbone", type=float, default=1e-5)
@@ -886,8 +901,8 @@ def parse_args():
     return p.parse_args()
 
 
-def build_loader(df: pd.DataFrame, classes: List[str], split: str, args, augment: bool, shuffle: bool) -> Tuple[MultimodalDataset, DataLoader]:
-    ds = MultimodalDataset(df, classes, split=split, fundus_size=args.fundus_size, augment=augment)
+def build_loader(df: pd.DataFrame, classes: List[str], split: str, args, augment: bool, shuffle: bool, label_col: str) -> Tuple[MultimodalDataset, DataLoader]:
+    ds = MultimodalDataset(df, classes, split=split, label_col=label_col, fundus_size=args.fundus_size, augment=augment)
     loader = DataLoader(ds, batch_size=args.batch_size, shuffle=shuffle, num_workers=args.num_workers, pin_memory=True)
     return ds, loader
 
@@ -902,7 +917,19 @@ def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     df = pd.read_csv(args.manifest, dtype=str).fillna("")
-    classes = sorted(df["gene"].unique().tolist())
+    if args.label_col == "auto":
+        if "sgene" in df.columns:
+            label_col = "sgene"
+        elif "gene" in df.columns:
+            label_col = "gene"
+        else:
+            raise ValueError("No label column found. Expected 'sgene' or 'gene'.")
+    else:
+        label_col = args.label_col
+        if label_col not in df.columns:
+            raise ValueError(f"--label-col={label_col} not found in manifest columns: {list(df.columns)}")
+
+    classes = sorted(df[label_col].unique().tolist())
     args.num_classes = args.num_classes or len(classes)
 
     oct_model = load_pretrained_oct_model(
@@ -923,7 +950,7 @@ def main():
 
     if args.mode == "prob_fusion":
         assert oct_model is not None and fundus_model is not None, "--oct-ckpt et --fundus-ckpt requis"
-        _, loader = build_loader(df, classes, split=args.split, args=args, augment=False, shuffle=False)
+        _, loader = build_loader(df, classes, split=args.split, args=args, augment=False, shuffle=False, label_col=label_col)
         model = ProbabilityFusionModel(oct_model, fundus_model, num_classes=args.num_classes, w_oct=args.w_oct, w_fundus=args.w_fundus).to(device)
         metrics = evaluate_prob_fusion(model, loader, device)
         save_json(metrics, out_dir / f"metrics_prob_fusion_{args.split}.json")
@@ -935,10 +962,12 @@ def main():
         assert oct_model is not None and fundus_model is not None, "--oct-ckpt et --fundus-ckpt requis"
         model = MultimodalLateFusionModel(oct_model, fundus_model, num_classes=args.num_classes, fundus_size=args.fundus_size).to(device)
 
-        _, train_loader = build_loader(df, classes, split="train", args=args, augment=True, shuffle=True)
-        _, val_loader = build_loader(df, classes, split="val", args=args, augment=False, shuffle=False)
+        _, train_loader = build_loader(df, classes, split="train", args=args, augment=True, shuffle=True, label_col=label_col)
+        _, val_loader = build_loader(df, classes, split="val", args=args, augment=False, shuffle=False, label_col=label_col)
 
-        class_weights = compute_soft_class_weights_from_df(df[df["split"] == "train"], classes, device)
+        train_df = df[df["split"] == "train"].copy()
+        train_df = train_df.rename(columns={label_col: "gene"})
+        class_weights = compute_soft_class_weights_from_df(train_df, classes, device)
         train_late_fusion(args, model, train_loader, val_loader, device, class_weights, out_dir, class_names=classes)
 
         best = torch.load(out_dir / "best_multimodal.pt", map_location=device)
@@ -960,7 +989,7 @@ def main():
         ckpt = torch.load(args.checkpoint, map_location=device)
         load_state_dict_report(model, resolve_state_dict(ckpt), strict=False, model_name="MultimodalLateFusion")
 
-        ds, _ = build_loader(df, classes, split=(args.split or "val"), args=args, augment=False, shuffle=False)
+        ds, _ = build_loader(df, classes, split=(args.split or "val"), args=args, augment=False, shuffle=False, label_col=label_col)
         sample = None
         for i in range(len(ds)):
             it = ds[i]

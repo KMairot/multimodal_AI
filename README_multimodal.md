@@ -15,12 +15,13 @@ Le script a été réaligné sur les APIs réelles du dépôt :
 - Fundus : implémentation alignée structurellement avec `train_fundus_only.py` pour compatibilité checkpoint.
 
 ## Hypothèses sur le manifest CSV
-Colonnes minimales :
-- `split` (`train` / `val` / `test`)
-- `gene`
-- `case_id`
-- `has_oct`, `has_ir`, `has_faf` (0/1)
-- `oct_path`, `ir_path`, `faf_path`
+Format confirmé côté utilisateur : `export_manifest.csv` avec colonnes
+`sgene,patient_key,laterality,oct_path,faf_path,ir_path,has_oct,has_faf,has_ir,split,export_dir`.
+
+Le script supporte maintenant :
+- `sgene` (prioritaire) ou `gene` comme colonne label (auto-détection),
+- `patient_key` + `laterality` pour construire `case_id` si absent,
+- les colonnes de disponibilité et chemins (`has_*`, `*_path`).
 
 ## Données manquantes
 - `has_fundus = 1` seulement si IR + FAF disponibles (mode strict par défaut).
